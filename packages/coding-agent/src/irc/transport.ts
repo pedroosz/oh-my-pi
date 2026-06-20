@@ -15,8 +15,9 @@ function wrap(socket: net.Socket): JsonConn {
 	socket.setEncoding("utf8");
 	socket.on("data", (chunk: string) => {
 		buf += chunk;
-		let nl: number;
-		while ((nl = buf.indexOf("\n")) >= 0) {
+		for (;;) {
+			const nl = buf.indexOf("\n");
+			if (nl < 0) break;
 			const line = buf.slice(0, nl);
 			buf = buf.slice(nl + 1);
 			if (!line) continue;

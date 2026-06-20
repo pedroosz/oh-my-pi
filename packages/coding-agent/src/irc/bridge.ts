@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { IrcBus, IrcDeliveryReceipt, IrcMessage, IrcRemoteRouter } from "./bus";
-import { type JsonConn, JsonSocketServer, connectJsonSocket } from "./transport";
+import { connectJsonSocket, type JsonConn, JsonSocketServer } from "./transport";
 
 export interface PeerAgent {
 	id: string;
