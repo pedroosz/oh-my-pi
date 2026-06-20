@@ -123,6 +123,11 @@ export class TeamBroker {
 	#onHello(conn: JsonConn, agents: PeerAgent[]): void {
 		this.#agentsOf.set(conn, agents);
 		for (const a of agents) {
+			// Don't let an announced id clobber a real local ref the lead owns
+			// (e.g. Main): a remote stub with session:null would break local
+			// delivery. Mirrors the connector-side guard in #onRoster.
+			const existing = this.registry.get(a.id);
+			if (existing && !existing.remote) continue;
 			this.#connOf.set(a.id, conn);
 			this.registry.register({
 				id: a.id,
@@ -167,6 +172,10 @@ export class TeamBroker {
 		this.#broadcastRoster();
 	}
 
+	// v1 limitation: the roster is computed at hello/close time only. Agents
+	// added or removed after connect (subagents spawned later, local agents that
+	// finish) are not re-propagated to peers. Dynamic membership is deferred to
+	// Plan B (registry.onChange rebroadcast).
 	#broadcastRoster(): void {
 		const all = [...this.#agentsOf.entries()];
 		// The lead's own in-process agents (e.g. Main) are not announced by any
@@ -174,7 +183,7 @@ export class TeamBroker {
 		// a child never learns about lead-local peers.
 		const leadAgents: PeerAgent[] = this.registry
 			.list()
-			.filter(ref => !ref.remote && ref.kind !== "advisor")
+			.filter(ref => !ref.remote && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"))
 			.map(ref => ({ id: ref.id, displayName: ref.displayName, kind: ref.kind === "main" ? "main" : "sub" }));
 		const connectorAgents = all.flatMap(([, a]) => a);
 		for (const [conn, own] of all) {
@@ -186,6 +195,9 @@ export class TeamBroker {
 
 	async close(): Promise<void> {
 		this.bus.setRemoteRouter(undefined);
+		// net.Server.close() waits for live connections to end, so close the
+		// connector sockets first or this would hang while peers stay connected.
+		for (const conn of this.#agentsOf.keys()) conn.close();
 		await this.#server.close();
 	}
 }
@@ -194,6 +206,7 @@ export class TeamBroker {
 export class TeamConnector {
 	#conn: JsonConn | undefined;
 	readonly #waiter = makeReceiptWaiter();
+	readonly #remoteIds = new Set<string>();
 
 	constructor(
 		private readonly bus: IrcBus,
@@ -210,6 +223,15 @@ export class TeamConnector {
 			if (frame.t === "roster") this.#onRoster(frame.agents);
 			else if (frame.t === "irc") void deliverInbound(this.bus, conn, frame);
 			else if (frame.t === "receipt") this.#waiter.settle(frame.reqId, frame.receipt);
+		});
+		conn.onClose(() => {
+			// Socket dropped: tear down the remote router and withdraw the remote
+			// refs we registered, else later sends hang the receipt timeout
+			// against a dead conn.
+			this.bus.setRemoteRouter(undefined);
+			this.#conn = undefined;
+			for (const id of this.#remoteIds) this.registry.unregister(id);
+			this.#remoteIds.clear();
 		});
 		conn.send({ t: "hello", agents: this.localAgents });
 		const router: IrcRemoteRouter = { deliver: msg => this.#sendToBroker(msg) };
@@ -235,6 +257,7 @@ export class TeamConnector {
 				remote: true,
 				status: "idle",
 			});
+			this.#remoteIds.add(a.id);
 		}
 	}
 

@@ -30,6 +30,20 @@ function whenRegistered(reg: AgentRegistry, id: string): Promise<void> {
 	return promise;
 }
 
+// Resolve once `id` is removed from the registry — used to await async socket
+// teardown deterministically (rule ts-no-test-timers).
+function whenRemoved(reg: AgentRegistry, id: string): Promise<void> {
+	if (!reg.get(id)) return Promise.resolve();
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const off = reg.onChange(e => {
+		if (e.type === "removed" && e.ref.id === id) {
+			off();
+			resolve();
+		}
+	});
+	return promise;
+}
+
 describe("team bridge end to end", () => {
 	it("delivers irc lead<->child across the socket", async () => {
 		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
@@ -69,6 +83,100 @@ describe("team bridge end to end", () => {
 		const r2 = await childBus.send({ from: "ChildA", to: "Main", body: "diverged: did X instead" });
 		expect(r2.outcome).toBe("injected");
 		expect(leadInbox.map(m => m.body)).toEqual(["diverged: did X instead"]);
+
+		connector.close();
+		await broker.close();
+	});
+
+	it("broker.close() resolves while a connector is still connected (fix 1)", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession([]) });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		const childReg = new AgentRegistry();
+		const childBus = new IrcBus(childReg);
+		childReg.register({ id: "ChildA", displayName: "ChildA", kind: "sub", session: fakeSession([]) });
+		const connector = new TeamConnector(childBus, childReg, [{ id: "ChildA", displayName: "ChildA", kind: "sub" }]);
+
+		const leadSeesChild = whenRegistered(leadReg, "ChildA");
+		await connector.connect(sockPath);
+		await leadSeesChild;
+
+		// Close WITHOUT closing the connector first. Before the fix this hung on
+		// net.Server.close() waiting for the live connection; a hang now fails
+		// the run by timeout. Reaching the assertions proves close() resolved.
+		await broker.close();
+
+		// And the server is truly down: a fresh connect to the same path fails.
+		const lateReg = new AgentRegistry();
+		const late = new TeamConnector(new IrcBus(lateReg), lateReg, []);
+		await expect(late.connect(sockPath)).rejects.toThrow();
+	});
+
+	it("connector tears down remote refs + router when the socket drops (fix 2)", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession([]) });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		const childReg = new AgentRegistry();
+		const childBus = new IrcBus(childReg);
+		childReg.register({ id: "ChildA", displayName: "ChildA", kind: "sub", session: fakeSession([]) });
+		const connector = new TeamConnector(childBus, childReg, [{ id: "ChildA", displayName: "ChildA", kind: "sub" }]);
+
+		const childSeesMain = whenRegistered(childReg, "Main");
+		await connector.connect(sockPath);
+		await childSeesMain;
+		expect(childReg.get("Main")?.remote).toBe(true);
+
+		// Drop the socket from the lead side; the connector's onClose must
+		// withdraw the remote ref it registered for Main.
+		const childForgetsMain = whenRemoved(childReg, "Main");
+		await broker.close();
+		await childForgetsMain;
+		expect(childReg.get("Main")).toBeUndefined();
+
+		// Router cleared too: a send to a remote target now fails fast instead of
+		// hanging the receipt timeout against the dead conn.
+		const r = await childBus.send({ from: "ChildA", to: "Main", body: "anyone?" });
+		expect(r.outcome).toBe("failed");
+	});
+
+	it("an announced id does not clobber a real local ref the lead owns (fix 4)", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		const leadInbox: IrcMessage[] = [];
+		const mainSession = fakeSession(leadInbox);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: mainSession });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		const childReg = new AgentRegistry();
+		const childBus = new IrcBus(childReg);
+		// Announce a colliding "Main" plus a genuinely new "ChildB". Awaiting
+		// ChildB's registration (later in the same synchronous hello loop) proves
+		// the Main collision was already handled.
+		const connector = new TeamConnector(childBus, childReg, [
+			{ id: "Main", displayName: "Impostor", kind: "sub" },
+			{ id: "ChildB", displayName: "ChildB", kind: "sub" },
+		]);
+
+		const leadSeesChildB = whenRegistered(leadReg, "ChildB");
+		await connector.connect(sockPath);
+		await leadSeesChildB;
+
+		const main = leadReg.get("Main");
+		expect(main?.remote).toBeFalsy();
+		expect(main?.session).toBe(mainSession);
 
 		connector.close();
 		await broker.close();

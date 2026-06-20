@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import { logger } from "@oh-my-pi/pi-utils";
 
 export interface JsonConn {
 	send(frame: unknown): void;
@@ -65,6 +66,9 @@ export class JsonSocketServer {
 		server.on("error", reject);
 		server.listen(socketPath, () => {
 			server.off("error", reject);
+			// Keep a durable error handler after listen: an emitted 'error' with
+			// no listener throws and crashes the process.
+			server.on("error", err => logger.warn("irc server error", { err }));
 			this.#server = server;
 			resolve();
 		});
