@@ -43,6 +43,8 @@ export interface AgentRef {
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
+	/** True when this ref is a peer in another process, reached via the team bridge (session is always null). */
+	remote?: boolean;
 }
 
 export type RegistryEvent =
@@ -60,6 +62,7 @@ export interface RegisterInput {
 	session: AgentSession | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
+	remote?: boolean;
 }
 
 export class AgentRegistry {
@@ -90,6 +93,7 @@ export class AgentRegistry {
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
+			remote: input.remote ?? false,
 			createdAt: now,
 			lastActivity: now,
 		};
