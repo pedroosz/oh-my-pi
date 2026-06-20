@@ -67,7 +67,7 @@ graph TD
 Three layers, sized very differently:
 
 1. **omp: cross-process `irc` transport (the real work).** Make `irc` / `AgentRegistry` peer-aware so a subagent running as an external omp process registers into the lead's registry and exchanges `irc` over a unix socket, behind the existing in-process `irc` API (send / wait / list / broadcast). Local vs remote peer becomes a transport detail. Reuse the collab `agents` + `bus` mirroring and the `agent-cmd` command path; add the missing piece, which is bidirectional `irc` peer messaging across the boundary (collab today is observe + steer, not full peer chat).
-2. **omp: team spawn path (thin).** A spawn mode in `task/executor.ts` that launches a subagent as an external omp process wired to the lead's broker, instead of in-process. Leverages `PI_SUBPROCESS_CMD` and the existing `RpcClient` spawn machinery. The child boots, connects to `$OMP_IRC_SOCKET`, registers under its assigned agent id, receives its assignment, and runs as a normal omp.
+2. **omp: team spawn path (thin).** Launch each subagent as an external omp **process** wired to the lead's broker via env (`OMP_IRC_SOCKET`, `OMP_AGENT_ID`, assignment). Under cmux the spawn is **cmux-mediated**: the lead asks cmux to open a tab running `omp` (reusing the cmux socket-client pattern in `tools/browser/cmux/`), so the child is a real interactive tab. In headless tests the lead spawns a plain process with the same env. NOTE: `RpcClient` / `--mode rpc` is the *rejected* headless-driving alternative (it owns the child's stdio, so a child cannot be both RpcClient-driven and an interactive tab) and is NOT used here; only its `ptree.spawn` cwd/env wiring is a reference. The child boots, connects to `$OMP_IRC_SOCKET`, registers under its agent id, receives its assignment, and runs as a normal omp.
 3. **cmux: `cmux omp` launch arm (mechanical).** Mirror `runOMX`: `resolveOMPExecutable` / `createOMPShimDirectory` (`~/.cmuxterm/omp-bin`) / `configureOMPEnvironment` / `runOMP`, plus dispatch, usage, recognized-command list, Go relay. The lead runs under the shim, so when its team spawn path opens a subagent it becomes a cmux tab via the shim -> `workspace.create` / `surface.split`. The already-built `cmux-omp-session.ts` hooks + `CMUX_SURFACE_ID` feed the sidebar; nothing new needed there.
 
 ## Topology: team mode vs collab
@@ -106,8 +106,8 @@ A subagent tab is a normal interactive omp. The human typing in it is just the a
 
 ## Reuse vs new
 
-- Reuse: `RpcClient` process spawn + `PI_SUBPROCESS_CMD`; `rpc-types.ts` frame style; collab `agents` / `bus` mirroring + `agent-cmd` codec; `AgentRegistry` / `EventBus` / `irc` API + tools; worktree lifecycle (`worktree` / `~/.omp/wt`); the entire cmux tmux-shim + `cmux-omp-session.ts` hooks + sidebar.
-- New: the bidirectional cross-process `irc` peer transport (core); the team spawn path in `task/executor.ts`; the `cmux omp` launch arm in cmux.
+- Reuse: the cmux socket-client pattern (`tools/browser/cmux/socket-client.ts`, line-delimited JSON over a unix socket) for both the team broker transport and the cmux spawn request; collab `agents` / `bus` mirroring + `agent-cmd` codec as the registry/bus-sync reference; `AgentRegistry` + `IrcBus` + the `irc` tool API (the bridge plugs a remote-delivery path into `IrcBus.send`, which today resolves the recipient via `registry.get(to).session.deliverIrcMessage` — remote refs have `session=null`, so they route over the socket instead); worktree lifecycle (`worktree` / `~/.omp/wt`, creation pattern from `gh.ts`); the entire cmux tmux-shim + `cmux-omp-session.ts` hooks + sidebar.
+- New: the bidirectional cross-process `irc` peer transport + bridge (core); the team spawn/orchestrator path; the `cmux omp` launch arm in cmux. (`RpcClient` / `--mode rpc` is reference-only, not used; see layer 2.)
 
 ## Open questions (resolve in the implementation plan)
 
