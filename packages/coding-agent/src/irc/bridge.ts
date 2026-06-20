@@ -169,9 +169,17 @@ export class TeamBroker {
 
 	#broadcastRoster(): void {
 		const all = [...this.#agentsOf.entries()];
+		// The lead's own in-process agents (e.g. Main) are not announced by any
+		// connector, so include them in every connector's roster too — otherwise
+		// a child never learns about lead-local peers.
+		const leadAgents: PeerAgent[] = this.registry
+			.list()
+			.filter(ref => !ref.remote && ref.kind !== "advisor")
+			.map(ref => ({ id: ref.id, displayName: ref.displayName, kind: ref.kind === "main" ? "main" : "sub" }));
+		const connectorAgents = all.flatMap(([, a]) => a);
 		for (const [conn, own] of all) {
 			const ownIds = new Set(own.map(a => a.id));
-			const others = all.flatMap(([, a]) => a).filter(a => !ownIds.has(a.id));
+			const others = [...connectorAgents, ...leadAgents].filter(a => !ownIds.has(a.id));
 			conn.send({ t: "roster", agents: others });
 		}
 	}
