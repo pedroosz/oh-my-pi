@@ -20,7 +20,7 @@ import { getWorktreeDir, hashPath, ptree } from "@oh-my-pi/pi-utils";
 
 import { TeamBroker } from "../irc/bridge";
 import { IrcBus } from "../irc/bus";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, type AgentStatus } from "../registry/agent-registry";
 import { resolveOmpCommand } from "../task/omp-command";
 import { CmuxSocketClient } from "../tools/browser/cmux/socket-client";
 import * as git from "../utils/git";
@@ -28,6 +28,7 @@ import * as git from "../utils/git";
 interface BrokerState {
 	broker: TeamBroker;
 	socketPath: string;
+	notifyUnsub: () => void;
 }
 
 /**
@@ -41,6 +42,65 @@ let brokerPromise: Promise<BrokerState> | undefined;
 /** Plain-spawn children tracked for {@link shutdownTeam}. cmux workspaces are owned by cmux. */
 const spawnedChildren = new Set<ptree.ChildProcess>();
 
+/** Cmux client surface used for completion notifications; injectable so the lead path is unit-testable. */
+export interface CmuxNotifierClient {
+	connect(): Promise<void>;
+	request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+	close(): void;
+}
+export type CmuxClientFactory = (opts: { socketPath: string; password?: string }) => CmuxNotifierClient;
+
+const defaultCmuxClientFactory: CmuxClientFactory = opts => new CmuxSocketClient(opts);
+
+/** Statuses a finished remote subagent settles into; reaching one fires the completion notification. */
+const COMPLETION_STATUSES = new Set<AgentStatus>(["idle", "aborted"]);
+
+/**
+ * Lead-side: watch the registry for remote subagents that finish (status moves
+ * from a live state into idle/aborted) and surface one cmux notification each.
+ * Headless (no CMUX_SOCKET_PATH) is a no-op. Tracking the previous status per
+ * id dedupes the idle->aborted tail the broker emits when a finished child's
+ * socket later drops, so one completion notifies exactly once.
+ */
+function subscribeCompletionNotifications(registry: AgentRegistry, makeClient: CmuxClientFactory): () => void {
+	const socketPath = process.env.CMUX_SOCKET_PATH;
+	if (!socketPath) return () => {};
+	const password = process.env.CMUX_SOCKET_PASSWORD || undefined;
+	const prevStatus = new Map<string, AgentStatus>();
+	return registry.onChange(event => {
+		const { ref } = event;
+		if (!ref.remote) return;
+		if (event.type === "removed") {
+			prevStatus.delete(ref.id);
+			return;
+		}
+		const before = prevStatus.get(ref.id);
+		prevStatus.set(ref.id, ref.status);
+		if (event.type !== "status_changed") return;
+		if (before !== undefined && COMPLETION_STATUSES.has(before)) return;
+		if (!COMPLETION_STATUSES.has(ref.status)) return;
+		void notifyCompletion(makeClient, socketPath, password, ref.id);
+	});
+}
+
+async function notifyCompletion(
+	makeClient: CmuxClientFactory,
+	socketPath: string,
+	password: string | undefined,
+	agentId: string,
+): Promise<void> {
+	const client = makeClient({ socketPath, password });
+	try {
+		await client.connect();
+		await client.request("notification.create", { title: agentId, body: "finished" });
+	} catch {
+		// Best-effort: a missing or closed cmux socket must not break the team or
+		// teardown. The per-tab sidebar still reflects status via the registry.
+	} finally {
+		client.close();
+	}
+}
+
 /**
  * Lazily start the single lead broker for this process and return its socket
  * path. Idempotent: every call after the first returns the same socket.
@@ -48,9 +108,10 @@ const spawnedChildren = new Set<ptree.ChildProcess>();
 export async function getOrStartBroker(
 	bus: IrcBus = IrcBus.global(),
 	registry: AgentRegistry = AgentRegistry.global(),
+	makeCmuxClient: CmuxClientFactory = defaultCmuxClientFactory,
 ): Promise<{ socketPath: string }> {
 	if (!brokerPromise) {
-		brokerPromise = startBroker(bus, registry).catch((err: unknown) => {
+		brokerPromise = startBroker(bus, registry, makeCmuxClient).catch((err: unknown) => {
 			// Don't memoize a rejected bind — let a later spawn retry.
 			brokerPromise = undefined;
 			throw err;
@@ -60,11 +121,16 @@ export async function getOrStartBroker(
 	return { socketPath };
 }
 
-async function startBroker(bus: IrcBus, registry: AgentRegistry): Promise<BrokerState> {
+async function startBroker(
+	bus: IrcBus,
+	registry: AgentRegistry,
+	makeCmuxClient: CmuxClientFactory,
+): Promise<BrokerState> {
 	const socketPath = join(tmpdir(), `omp-team-${process.pid}-${randomBytes(4).toString("hex")}.sock`);
 	const broker = new TeamBroker(bus, registry);
 	await broker.listen(socketPath);
-	return { broker, socketPath };
+	const notifyUnsub = subscribeCompletionNotifications(registry, makeCmuxClient);
+	return { broker, socketPath, notifyUnsub };
 }
 
 export interface TeamChildSpawn {
@@ -244,5 +310,6 @@ export async function shutdownTeam(): Promise<void> {
 	brokerPromise = undefined;
 	if (!pending) return;
 	const state = await pending.catch(() => undefined);
+	state?.notifyUnsub();
 	await state?.broker.close();
 }
