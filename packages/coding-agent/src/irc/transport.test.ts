@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JsonSocketServer, connectJsonSocket } from "./transport";
+import { connectJsonSocket, JsonSocketServer } from "./transport";
 
 describe("json socket transport", () => {
 	it("round-trips line-delimited frames over a unix socket", async () => {
