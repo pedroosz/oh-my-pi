@@ -37,6 +37,11 @@ export interface IrcDeliveryReceipt {
 	error?: string;
 }
 
+export interface IrcRemoteRouter {
+	/** Deliver a message addressed to a remote (other-process) peer. */
+	deliver(message: IrcMessage, opts?: { expectsReply?: boolean }): Promise<IrcDeliveryReceipt>;
+}
+
 interface IrcWaiter {
 	from?: string;
 	resolve: (msg: IrcMessage) => void;
@@ -65,6 +70,12 @@ export class IrcBus {
 	readonly #lifecycle: () => AgentLifecycleManager;
 	readonly #mailboxes = new Map<string, IrcMessage[]>();
 	readonly #waiters = new Map<string, IrcWaiter[]>();
+
+	#remoteRouter: IrcRemoteRouter | undefined;
+
+	setRemoteRouter(router: IrcRemoteRouter | undefined): void {
+		this.#remoteRouter = router;
+	}
 
 	constructor(registry: AgentRegistry = AgentRegistry.global(), lifecycle?: AgentLifecycleManager) {
 		this.#registry = registry;
@@ -105,6 +116,13 @@ export class IrcBus {
 				outcome: "failed",
 				error: `Agent "${message.to}" is a read-only advisor transcript and cannot be messaged.`,
 			};
+		}
+
+		if (ref.remote) {
+			if (!this.#remoteRouter) {
+				return { to: message.to, outcome: "failed", error: `No team bridge for remote agent "${message.to}".` };
+			}
+			return this.#remoteRouter.deliver(message, opts);
 		}
 
 		let revived = false;
