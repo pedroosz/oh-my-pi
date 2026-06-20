@@ -50,6 +50,7 @@ import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { IrcBus } from "./irc/bus";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -57,6 +58,7 @@ import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
+import { AgentRegistry } from "./registry/agent-registry";
 import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
@@ -72,6 +74,7 @@ import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import { joinTeamIfConfigured } from "./team/join";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
@@ -785,6 +788,15 @@ async function buildSessionOptions(
 		options.deadline = Date.now() + parsed.maxTime * 1000;
 	}
 
+	// Team mode: a child omp launched by a lead's team spawn registers its
+	// top-level session under the lead-assigned id (the same id the lead
+	// announced to its broker roster), so the lead can address it over the
+	// cross-process irc bridge. Absent OMP_AGENT_ID the session stays
+	// MAIN_AGENT_ID, the normal standalone identity.
+	if (process.env.OMP_AGENT_ID) {
+		options.agentId = process.env.OMP_AGENT_ID;
+	}
+
 	// Auto-discover SYSTEM.md if no CLI system prompt provided
 	const systemPromptSource = parsed.systemPrompt ?? discoverSystemPromptFile();
 	const resolvedSystemPrompt = await resolvePromptInput(systemPromptSource, "system prompt");
@@ -1321,6 +1333,16 @@ export async function runRootCommand(
 			}),
 			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
 		);
+
+		// Team mode (child side): if a lead launched this process as a team
+		// subagent it set OMP_IRC_SOCKET. The main session is now registered, so
+		// connect to the lead's broker — from here the in-process `irc` tool
+		// reaches across the process boundary. Best-effort: failure degrades to a
+		// normal standalone omp. Gated strictly on OMP_IRC_SOCKET so the default
+		// in-process path pays nothing.
+		if (process.env.OMP_IRC_SOCKET) {
+			await joinTeamIfConfigured(process.env, IrcBus.global(), AgentRegistry.global());
+		}
 		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 		}
