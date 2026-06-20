@@ -3,8 +3,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentRegistry } from "../registry/agent-registry";
-import { IrcBus, type IrcMessage } from "./bus";
 import { TeamBroker, TeamConnector } from "./bridge";
+import { IrcBus, type IrcMessage } from "./bus";
 
 // Minimal fake AgentSession: records delivered messages, reports "injected".
 function fakeSession(sink: IrcMessage[]) {
@@ -177,6 +177,40 @@ describe("team bridge end to end", () => {
 		const main = leadReg.get("Main");
 		expect(main?.remote).toBeFalsy();
 		expect(main?.session).toBe(mainSession);
+
+		connector.close();
+		await broker.close();
+	});
+
+	it("propagates dynamic roster membership to a connected child", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession([]) });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		const childReg = new AgentRegistry();
+		const childBus = new IrcBus(childReg);
+		childReg.register({ id: "ChildA", displayName: "ChildA", kind: "sub", session: fakeSession([]) });
+		const connector = new TeamConnector(childBus, childReg, [{ id: "ChildA", displayName: "ChildA", kind: "sub" }]);
+
+		const childSeesMain = whenRegistered(childReg, "Main");
+		await connector.connect(sockPath);
+		await childSeesMain;
+
+		// A lead-local agent registered AFTER connect must reach the child.
+		const childSeesLate = whenRegistered(childReg, "LateLead");
+		leadReg.register({ id: "LateLead", displayName: "LateLead", kind: "sub", session: fakeSession([]) });
+		await childSeesLate;
+		expect(childReg.get("LateLead")?.remote).toBe(true);
+
+		// And removing it on the lead withdraws it from the child's roster.
+		const childForgetsLate = whenRemoved(childReg, "LateLead");
+		leadReg.unregister("LateLead");
+		await childForgetsLate;
+		expect(childReg.get("LateLead")).toBeUndefined();
 
 		connector.close();
 		await broker.close();

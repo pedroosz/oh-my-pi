@@ -96,6 +96,8 @@ export class TeamBroker {
 	readonly #connOf = new Map<string, JsonConn>(); // agentId -> owning connector
 	readonly #agentsOf = new Map<JsonConn, PeerAgent[]>();
 	readonly #waiter = makeReceiptWaiter();
+	#unsubscribeRegistry: (() => void) | undefined;
+	#rosterScheduled = false;
 
 	constructor(
 		private readonly bus: IrcBus,
@@ -107,6 +109,20 @@ export class TeamBroker {
 		await this.#server.listen(socketPath);
 		const router: IrcRemoteRouter = { deliver: msg => this.#routeTo(this.#connOf.get(msg.to), msg) };
 		this.bus.setRemoteRouter(router);
+		// Dynamic membership: re-announce the roster when agents come or go after
+		// the initial handshake (later-spawned subagents, agents that finish).
+		// Debounced to one broadcast per microtask so a burst of register/status
+		// changes collapses into a single roster frame.
+		this.#unsubscribeRegistry = this.registry.onChange(() => this.#scheduleRosterBroadcast());
+	}
+
+	#scheduleRosterBroadcast(): void {
+		if (this.#rosterScheduled) return;
+		this.#rosterScheduled = true;
+		queueMicrotask(() => {
+			this.#rosterScheduled = false;
+			this.#broadcastRoster();
+		});
 	}
 
 	#onConn(conn: JsonConn): void {
@@ -172,10 +188,6 @@ export class TeamBroker {
 		this.#broadcastRoster();
 	}
 
-	// v1 limitation: the roster is computed at hello/close time only. Agents
-	// added or removed after connect (subagents spawned later, local agents that
-	// finish) are not re-propagated to peers. Dynamic membership is deferred to
-	// Plan B (registry.onChange rebroadcast).
 	#broadcastRoster(): void {
 		const all = [...this.#agentsOf.entries()];
 		// The lead's own in-process agents (e.g. Main) are not announced by any
@@ -194,6 +206,8 @@ export class TeamBroker {
 	}
 
 	async close(): Promise<void> {
+		this.#unsubscribeRegistry?.();
+		this.#unsubscribeRegistry = undefined;
 		this.bus.setRemoteRouter(undefined);
 		// net.Server.close() waits for live connections to end, so close the
 		// connector sockets first or this would hang while peers stay connected.
@@ -247,6 +261,15 @@ export class TeamConnector {
 	}
 
 	#onRoster(agents: PeerAgent[]): void {
+		const next = new Set(agents.map(a => a.id));
+		// Withdraw remote refs that left the latest roster (a lead-side agent
+		// finished, or another child disconnected) — without this a child's roster
+		// only ever grows. Only refs we registered (#remoteIds) are touched.
+		for (const id of [...this.#remoteIds]) {
+			if (next.has(id)) continue;
+			this.registry.unregister(id);
+			this.#remoteIds.delete(id);
+		}
 		for (const a of agents) {
 			if (this.registry.get(a.id)) continue;
 			this.registry.register({
