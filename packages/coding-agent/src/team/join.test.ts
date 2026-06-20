@@ -81,7 +81,47 @@ describe("joinTeamIfConfigured", () => {
 		// Path with no listener: connect attempts are refused, retries exhaust,
 		// and the helper resolves undefined instead of throwing or hanging.
 		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-join-")), "irc.sock");
-		const connector = await joinTeamIfConfigured({ OMP_IRC_SOCKET: sockPath }, bus, reg);
+		// backoffMs:0 keeps the exhausted-retry path event-fast (no wall-clock sleep).
+		const connector = await joinTeamIfConfigured({ OMP_IRC_SOCKET: sockPath }, bus, reg, { backoffMs: 0 });
 		expect(connector).toBeUndefined();
+	});
+
+	it('announces a child as kind "sub" to the lead and to siblings', async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-join-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession() });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		// First child joins; the lead classifies it purely from the child's hello.
+		const childAReg = new AgentRegistry();
+		const childABus = new IrcBus(childAReg);
+		const leadSeesA = whenRegistered(leadReg, "ChildA");
+		const connA = await joinTeamIfConfigured(
+			{ OMP_IRC_SOCKET: sockPath, OMP_AGENT_ID: "ChildA" },
+			childABus,
+			childAReg,
+		);
+		await leadSeesA;
+		expect(leadReg.get("ChildA")?.kind).toBe("sub");
+
+		// Second child joins; the broker's roster broadcast carries ChildA to it,
+		// so a sibling must also classify ChildA as a subagent, not a co-equal main.
+		const childBReg = new AgentRegistry();
+		const childBBus = new IrcBus(childBReg);
+		const bSeesA = whenRegistered(childBReg, "ChildA");
+		const connB = await joinTeamIfConfigured(
+			{ OMP_IRC_SOCKET: sockPath, OMP_AGENT_ID: "ChildB" },
+			childBBus,
+			childBReg,
+		);
+		await bSeesA;
+		expect(childBReg.get("ChildA")?.kind).toBe("sub");
+
+		connA?.close();
+		connB?.close();
+		await broker.close();
 	});
 });

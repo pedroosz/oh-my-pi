@@ -42,6 +42,9 @@ let brokerPromise: Promise<BrokerState> | undefined;
 /** Plain-spawn children tracked for {@link shutdownTeam}. cmux workspaces are owned by cmux. */
 const spawnedChildren = new Set<ptree.ChildProcess>();
 
+/** A spawned child that never announces (boot crash) leaves a phantom remote ref; reap it after this delay if no hello arrives. */
+const CONNECT_WATCHDOG_MS = 30_000;
+
 /** Cmux client surface used for completion notifications; injectable so the lead path is unit-testable. */
 export interface CmuxNotifierClient {
 	connect(): Promise<void>;
@@ -109,7 +112,7 @@ export async function getOrStartBroker(
 	bus: IrcBus = IrcBus.global(),
 	registry: AgentRegistry = AgentRegistry.global(),
 	makeCmuxClient: CmuxClientFactory = defaultCmuxClientFactory,
-): Promise<{ socketPath: string }> {
+): Promise<{ socketPath: string; broker: TeamBroker }> {
 	if (!brokerPromise) {
 		brokerPromise = startBroker(bus, registry, makeCmuxClient).catch((err: unknown) => {
 			// Don't memoize a rejected bind — let a later spawn retry.
@@ -117,8 +120,8 @@ export async function getOrStartBroker(
 			throw err;
 		});
 	}
-	const { socketPath } = await brokerPromise;
-	return { socketPath };
+	const { socketPath, broker } = await brokerPromise;
+	return { socketPath, broker };
 }
 
 async function startBroker(
@@ -182,10 +185,12 @@ export async function spawnTeamSubagent(opts: {
 	command?: { cmd: string; args: string[] };
 	/** Opt-in: run the child in a dedicated `team/<id>` git worktree (default off). */
 	worktree?: boolean;
+	/** Reap the placeholder after this long if the child never connects (default {@link CONNECT_WATCHDOG_MS}); 0 reaps next tick, negative disables. Test seam. */
+	connectWatchdogMs?: number;
 }): Promise<void> {
 	const bus = IrcBus.global();
 	const registry = AgentRegistry.global();
-	const { socketPath } = await getOrStartBroker(bus, registry);
+	const { socketPath, broker } = await getOrStartBroker(bus, registry);
 
 	if (!registry.get(opts.id)) {
 		registry.register({
@@ -212,8 +217,25 @@ export async function spawnTeamSubagent(opts: {
 		command: opts.command,
 	});
 
+	// Reap the placeholder if the child never announces over the socket (boot
+	// crash, missing model/key in non-interactive mode): with no hello the
+	// broker's close handler never runs, so nothing else would clear it.
+	// Unref'd so a pending watchdog can't keep this process alive.
+	const watchdogMs = opts.connectWatchdogMs ?? CONNECT_WATCHDOG_MS;
+	const armWatchdog = (): ReturnType<typeof setTimeout> | undefined => {
+		if (watchdogMs < 0) return undefined;
+		const timer = setTimeout(() => {
+			if (!broker.isConnected(opts.id)) registry.unregister(opts.id);
+		}, watchdogMs);
+		timer.unref?.();
+		return timer;
+	};
+
 	const cmuxSocket = process.env.CMUX_SOCKET_PATH;
 	if (cmuxSocket) {
+		// cmux owns the child's process lifecycle (it is not in spawnedChildren),
+		// so the watchdog is the only path that reclaims a never-connected child.
+		armWatchdog();
 		await spawnViaCmux({
 			socketPath: cmuxSocket,
 			password: process.env.CMUX_SOCKET_PASSWORD || undefined,
@@ -225,9 +247,19 @@ export async function spawnTeamSubagent(opts: {
 		return;
 	}
 
+	const watchdog = armWatchdog();
 	const child = ptree.spawn(spawn.argv, { cwd: spawn.cwd, env: spawn.env });
 	spawnedChildren.add(child);
-	void child.exited.catch(() => {}).finally(() => spawnedChildren.delete(child));
+	void child.exited
+		.catch(() => {})
+		.finally(() => {
+			spawnedChildren.delete(child);
+			// Child died: if it never connected, the broker's socket-close reaper
+			// never fires, so drop the phantom placeholder here (the connected
+			// case is handled by that reaper on socket drop).
+			if (!broker.isConnected(opts.id)) registry.unregister(opts.id);
+			if (watchdog) clearTimeout(watchdog);
+		});
 	// Drain stdout: a chatty child can otherwise wedge on a full stdout pipe
 	// (ptree pipes stdout and only auto-drains stderr).
 	void new Response(child.stdout).text().catch(() => {});

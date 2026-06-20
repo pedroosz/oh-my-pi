@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { AgentRegistry } from "../registry/agent-registry";
 import { TeamBroker, TeamConnector } from "./bridge";
 import { IrcBus, type IrcMessage } from "./bus";
+import { connectJsonSocket } from "./transport";
 
 // Minimal fake AgentSession: records delivered messages, reports "injected".
 function fakeSession(sink: IrcMessage[]) {
@@ -267,6 +268,34 @@ describe("team bridge end to end", () => {
 		expect(childReg.get("Main")?.status).toBe("idle");
 
 		connector.close();
+		await broker.close();
+	});
+
+	it("fails a pending receipt fast when the target conn closes before acking (fix 4)", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession([]) });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		// A raw conn that announces ChildA but never acks an irc frame, then drops.
+		// (A real TeamConnector always auto-replies a receipt, so we go raw here.)
+		const raw = await connectJsonSocket(sockPath);
+		const leadSeesChild = whenRegistered(leadReg, "ChildA");
+		raw.send({ t: "hello", agents: [{ id: "ChildA", displayName: "ChildA", kind: "sub", status: "running" }] });
+		await leadSeesChild;
+
+		// On the forwarded irc frame the raw child drops instead of acking. The
+		// broker's close handler must settle the pending receipt now, not after
+		// the 30s receipt timeout (a stall would blow the test's default timeout).
+		raw.onFrame(frame => {
+			if (frame && typeof frame === "object" && "t" in frame && frame.t === "irc") raw.close();
+		});
+		const receipt = await leadBus.send({ from: "Main", to: "ChildA", body: "ping" });
+		expect(receipt.outcome).toBe("failed");
+
 		await broker.close();
 	});
 });

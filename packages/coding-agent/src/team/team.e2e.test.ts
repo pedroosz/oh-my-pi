@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import process from "node:process";
 import { IrcBus, type IrcMessage } from "../irc/bus";
@@ -22,6 +22,20 @@ function leadSession(onMessage: (m: IrcMessage) => void) {
 // deterministically (rule ts-no-test-timers).
 function whenRemoved(reg: AgentRegistry, id: string): Promise<void> {
 	if (!reg.get(id)) return Promise.resolve();
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const off = reg.onChange(event => {
+		if (event.type === "removed" && event.ref.id === id) {
+			off();
+			resolve();
+		}
+	});
+	return promise;
+}
+
+// Resolve on the NEXT "removed" event for `id`, with no current-presence
+// shortcut. Armed before a spawn whose placeholder is registered then reclaimed,
+// so it observes that reclamation rather than resolving on the not-yet-present id.
+function whenRemovedNext(reg: AgentRegistry, id: string): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 	const off = reg.onChange(event => {
 		if (event.type === "removed" && event.ref.id === id) {
@@ -92,6 +106,72 @@ describe("team e2e: cross-process spawn + irc", () => {
 			await childAremoved;
 			expect(registry.get("ChildA")).toBeUndefined();
 			expect(registry.get("ChildB")?.remote).toBe(true);
+		} finally {
+			await shutdownTeam();
+		}
+	}, 30_000);
+});
+
+describe("team e2e: phantom placeholder reclamation", () => {
+	// Force the plain ptree spawn path: this environment may export
+	// CMUX_SOCKET_PATH, which would otherwise route spawns through real cmux
+	// workspaces (untracked, so shutdownTeam could not reclaim them).
+	const savedCmux = process.env.CMUX_SOCKET_PATH;
+	beforeEach(() => {
+		delete process.env.CMUX_SOCKET_PATH;
+	});
+	afterEach(() => {
+		if (savedCmux === undefined) delete process.env.CMUX_SOCKET_PATH;
+		else process.env.CMUX_SOCKET_PATH = savedCmux;
+	});
+	it("reclaims a placeholder when the child exits before connecting (plain path)", async () => {
+		IrcBus.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		const bus = IrcBus.global();
+		const registry = AgentRegistry.global();
+		registry.register({ id: "Main", displayName: "Main", kind: "main", session: leadSession(() => {}) });
+
+		try {
+			await getOrStartBroker(bus, registry);
+			// Passing only once the placeholder is both registered and then removed
+			// (a never-registered id would leave this pending and time the test out).
+			const gone = whenRemovedNext(registry, "DeadChild");
+			await spawnTeamSubagent({
+				id: "DeadChild",
+				assignment: "noop",
+				cwd: process.cwd(),
+				// Exits immediately, never joining the broker: no hello, so the
+				// socket-close reaper never runs and child.exited must clean up.
+				command: { cmd: "bun", args: ["-e", "process.exit(1)"] },
+			});
+			await gone;
+			expect(registry.get("DeadChild")).toBeUndefined();
+		} finally {
+			await shutdownTeam();
+		}
+	}, 30_000);
+
+	it("reclaims a placeholder via the connect watchdog when the child never joins", async () => {
+		IrcBus.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		const bus = IrcBus.global();
+		const registry = AgentRegistry.global();
+		registry.register({ id: "Main", displayName: "Main", kind: "main", session: leadSession(() => {}) });
+
+		try {
+			await getOrStartBroker(bus, registry);
+			const gone = whenRemovedNext(registry, "Loner");
+			await spawnTeamSubagent({
+				id: "Loner",
+				assignment: "noop",
+				cwd: process.cwd(),
+				// Stays alive but never joins the broker, so only the watchdog
+				// (injected to fire next tick) can reclaim the placeholder.
+				command: { cmd: "bun", args: ["-e", "setInterval(() => {}, 1000)"] },
+				connectWatchdogMs: 0,
+			});
+			await gone;
+			expect(registry.get("Loner")).toBeUndefined();
 		} finally {
 			await shutdownTeam();
 		}

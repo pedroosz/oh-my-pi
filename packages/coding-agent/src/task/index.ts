@@ -1045,7 +1045,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const assignment = (params.assignment ?? "").trim();
 		const isolationMode = this.session.settings.get("task.isolation.mode");
 		const isolationRequested = "isolated" in params ? params.isolated === true : false;
-		const isIsolated = isolationMode !== "none" && isolationRequested;
+		const isolationEnabled = isolationMode !== "none" && isolationRequested;
+		// In-process isolation (worktree + commit/merge) cannot apply to a
+		// fire-and-forget cross-process team child; under OMP_TEAM the isolation
+		// intent is routed to the child's own git worktree instead
+		// (sharedRunOptions.teamWorktree -> spawnTeamSubagent({ worktree: true })).
+		const isIsolated = isolationEnabled && !process.env.OMP_TEAM;
 		const mergeMode = this.session.settings.get("task.isolation.merge");
 		const commitStyle = this.session.settings.get("task.isolation.commits");
 		const taskDepth = this.session.taskDepth ?? 0;
@@ -1265,6 +1270,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 			const sharedRunOptions = {
 				cwd: this.session.cwd,
+				teamWorktree: isolationEnabled,
 				agent: effectiveAgent,
 				task: renderSubagentUserPrompt(assignment),
 				assignment,

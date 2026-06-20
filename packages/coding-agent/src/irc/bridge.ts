@@ -55,26 +55,58 @@ function asFrame(raw: unknown): WireFrame | undefined {
 	return undefined;
 }
 
-/** Correlate outbound irc frames to their receipt frames over one conn. */
+/**
+ * Correlate outbound irc frames to their receipt frames. Each pending request
+ * remembers its owning conn + target so an owning conn's close can fail-fast
+ * its in-flight receipts (peer dropped before acking) instead of stalling the
+ * full receipt timeout.
+ */
 function makeReceiptWaiter() {
-	const pending = new Map<string, (r: IrcDeliveryReceipt) => void>();
+	interface Pending {
+		owner: JsonConn | undefined;
+		to: string;
+		settle: (r: IrcDeliveryReceipt) => void;
+	}
+	const pending = new Map<string, Pending>();
+	const fail = (entry: Pending, error: string) => entry.settle({ to: entry.to, outcome: "failed", error });
 	return {
-		track(reqId: string): Promise<IrcDeliveryReceipt> {
+		track(reqId: string, owner?: JsonConn, to = ""): Promise<IrcDeliveryReceipt> {
 			const { promise, resolve } = Promise.withResolvers<IrcDeliveryReceipt>();
 			const timer = setTimeout(() => {
 				pending.delete(reqId);
-				resolve({ to: "", outcome: "failed", error: "team bridge receipt timeout" });
+				resolve({ to, outcome: "failed", error: "team bridge receipt timeout" });
 			}, REQUEST_TIMEOUT_MS);
 			timer.unref?.();
-			pending.set(reqId, r => {
-				clearTimeout(timer);
-				resolve(r);
+			pending.set(reqId, {
+				owner,
+				to,
+				settle: r => {
+					clearTimeout(timer);
+					resolve(r);
+				},
 			});
 			return promise;
 		},
 		settle(reqId: string, receipt: IrcDeliveryReceipt): void {
-			pending.get(reqId)?.(receipt);
+			const entry = pending.get(reqId);
+			if (!entry) return;
 			pending.delete(reqId);
+			entry.settle(receipt);
+		},
+		/** Fail every in-flight receipt owned by `owner` (its conn just closed). */
+		failOwner(owner: JsonConn, error: string): void {
+			for (const [reqId, entry] of pending) {
+				if (entry.owner !== owner) continue;
+				pending.delete(reqId);
+				fail(entry, error);
+			}
+		},
+		/** Fail every in-flight receipt (this side's only conn dropped). */
+		failAll(error: string): void {
+			for (const [reqId, entry] of pending) {
+				pending.delete(reqId);
+				fail(entry, error);
+			}
 		},
 	};
 }
@@ -82,6 +114,9 @@ function makeReceiptWaiter() {
 /** Deliver an inbound frame to a LOCAL agent via this process's bus; reply a receipt. */
 async function deliverInbound(bus: IrcBus, conn: JsonConn, frame: IrcFrame): Promise<void> {
 	let receipt: IrcDeliveryReceipt;
+	// `expectsReply` is intentionally not propagated cross-process: the
+	// synchronous in-batch auto-reply it gates cannot span processes. A remote
+	// recipient replies via a real turn over the bridge, never an inline reply.
 	try {
 		receipt = await bus.send({
 			from: frame.msg.from,
@@ -196,12 +231,20 @@ export class TeamBroker {
 	#routeTo(conn: JsonConn | undefined, msg: IrcMessage): Promise<IrcDeliveryReceipt> {
 		if (!conn) return Promise.resolve({ to: msg.to, outcome: "failed", error: `No connector for "${msg.to}".` });
 		const reqId = randomUUID();
-		const p = this.#waiter.track(reqId);
+		const p = this.#waiter.track(reqId, conn, msg.to);
 		conn.send({ t: "irc", reqId, msg });
 		return p;
 	}
 
+	/** True while `id` has announced over a still-open conn (used to reap a placeholder whose child never connected). */
+	isConnected(id: string): boolean {
+		return this.#connOf.has(id);
+	}
+
 	#onClose(conn: JsonConn): void {
+		// Settle any irc the lead routed to this conn before it acked: the peer
+		// dropped mid-flight, so fail now instead of stalling the receipt timeout.
+		this.#waiter.failOwner(conn, "peer disconnected");
 		const agents = this.#agentsOf.get(conn) ?? [];
 		for (const a of agents) {
 			this.#connOf.delete(a.id);
@@ -242,6 +285,11 @@ export class TeamBroker {
 		// net.Server.close() waits for live connections to end, so close the
 		// connector sockets first or this would hang while peers stay connected.
 		for (const conn of this.#agentsOf.keys()) conn.close();
+		// Drop membership so a roster microtask queued just before close (by a
+		// final onChange) broadcasts over an empty set instead of writing to the
+		// now-destroyed sockets.
+		this.#agentsOf.clear();
+		this.#connOf.clear();
 		await this.#server.close();
 	}
 }
@@ -280,6 +328,9 @@ export class TeamConnector {
 			this.#unsubscribeRegistry = undefined;
 			for (const id of this.#remoteIds) this.registry.unregister(id);
 			this.#remoteIds.clear();
+			// In-flight sends will never be acked over the dead conn; fail them
+			// now rather than stall each one for the full receipt timeout.
+			this.#waiter.failAll("team bridge connection closed");
 		});
 		this.#sendHello();
 		// Re-announce when one of THIS connector's local agents changes status
@@ -296,7 +347,7 @@ export class TeamConnector {
 	#sendToBroker(msg: IrcMessage): Promise<IrcDeliveryReceipt> {
 		if (!this.#conn) return Promise.resolve({ to: msg.to, outcome: "failed", error: "team bridge not connected" });
 		const reqId = randomUUID();
-		const p = this.#waiter.track(reqId);
+		const p = this.#waiter.track(reqId, this.#conn, msg.to);
 		this.#conn.send({ t: "irc", reqId, msg });
 		return p;
 	}

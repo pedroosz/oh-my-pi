@@ -25,23 +25,30 @@ export async function joinTeamIfConfigured(
 	env: Record<string, string | undefined>,
 	bus: IrcBus,
 	registry: AgentRegistry,
+	opts: { maxAttempts?: number; backoffMs?: number } = {},
 ): Promise<TeamConnector | undefined> {
 	const socketPath = env.OMP_IRC_SOCKET;
 	if (!socketPath || env.OMP_TEAM) return undefined;
 
 	const id = env.OMP_AGENT_ID ?? MAIN_AGENT_ID;
-	const connector = new TeamConnector(bus, registry, [{ id, displayName: id, kind: "main" }]);
+	const maxAttempts = opts.maxAttempts ?? MAX_CONNECT_ATTEMPTS;
+	const backoffMs = opts.backoffMs ?? RETRY_BACKOFF_MS;
+	// A connector is always a lead-spawned team child (gated above on
+	// OMP_IRC_SOCKET && !OMP_TEAM), so it announces itself as kind "sub" so the
+	// lead and sibling rosters classify it as a subagent, not a co-equal main.
+	// Its own process-private self-registration stays "main".
+	const connector = new TeamConnector(bus, registry, [{ id, displayName: id, kind: "sub" }]);
 
-	for (let attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS; attempt++) {
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		try {
 			await connector.connect(socketPath);
 			return connector;
 		} catch {
-			if (attempt === MAX_CONNECT_ATTEMPTS) return undefined;
+			if (attempt === maxAttempts) return undefined;
 			// Brief backoff: the broker may not have finished binding the socket
 			// yet (the lead spawned us moments ago). Awaited only in production —
 			// the connect succeeds first try once the broker is up.
-			await Bun.sleep(RETRY_BACKOFF_MS);
+			await Bun.sleep(backoffMs);
 		}
 	}
 	return undefined;

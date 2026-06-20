@@ -260,6 +260,8 @@ function getReportFindingKey(value: unknown): string | null {
 export interface ExecutorOptions {
 	cwd: string;
 	worktree?: string;
+	/** Under OMP_TEAM, run the spawned child in its own `team/<id>` git worktree (the cross-process analogue of in-process isolation). Ignored off team mode. */
+	teamWorktree?: boolean;
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
@@ -1702,6 +1704,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		index,
 		id,
 		worktree,
+		teamWorktree,
 		modelOverride,
 		thinkingLevel,
 		outputSchema,
@@ -1744,7 +1747,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// irc, not through this in-process result. v1 is single-level: a child never
 	// re-enters here because buildTeamChildSpawn strips OMP_TEAM from its env.
 	if (process.env.OMP_TEAM) {
-		await spawnTeamSubagent({ id, assignment: assignment ?? task, cwd });
+		await spawnTeamSubagent({ id, assignment: assignment ?? task, cwd, worktree: teamWorktree });
 		return {
 			index,
 			id,
