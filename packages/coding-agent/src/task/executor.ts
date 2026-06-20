@@ -5,6 +5,7 @@
  */
 
 import path from "node:path";
+import process from "node:process";
 import type { AgentEvent, AgentIdentity, AgentTelemetryConfig, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, Usage } from "@oh-my-pi/pi-ai";
@@ -41,6 +42,7 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
+import { spawnTeamSubagent } from "../team/orchestrator";
 import type { ContextFileEntry } from "../tools";
 import { isIrcEnabled } from "../tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
@@ -1733,6 +1735,32 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			error: "Cancelled before start",
 			aborted: true,
 			abortReason: "Cancelled before start",
+		};
+	}
+
+	// Team mode: subagents run as separate omp processes that join the lead's
+	// irc bridge instead of as in-process AgentSessions. Route the spawn across
+	// the process boundary and return immediately — the child reports back over
+	// irc, not through this in-process result. v1 is single-level: a child never
+	// re-enters here because buildTeamChildSpawn strips OMP_TEAM from its env.
+	if (process.env.OMP_TEAM) {
+		await spawnTeamSubagent({ id, assignment: assignment ?? task, cwd });
+		return {
+			index,
+			id,
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			assignment,
+			description: options.description,
+			exitCode: 0,
+			output: `Launched team subagent "${id}".`,
+			stderr: "",
+			truncated: false,
+			durationMs: Date.now() - startTime,
+			tokens: 0,
+			requests: 0,
+			modelOverride,
 		};
 	}
 
