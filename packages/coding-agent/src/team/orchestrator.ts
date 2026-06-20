@@ -11,17 +11,19 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import process from "node:process";
 
-import { ptree } from "@oh-my-pi/pi-utils";
+import { getWorktreeDir, hashPath, ptree } from "@oh-my-pi/pi-utils";
 
 import { TeamBroker } from "../irc/bridge";
 import { IrcBus } from "../irc/bus";
 import { AgentRegistry } from "../registry/agent-registry";
 import { resolveOmpCommand } from "../task/omp-command";
 import { CmuxSocketClient } from "../tools/browser/cmux/socket-client";
+import * as git from "../utils/git";
 
 interface BrokerState {
 	broker: TeamBroker;
@@ -112,6 +114,8 @@ export async function spawnTeamSubagent(opts: {
 	assignment: string;
 	cwd: string;
 	command?: { cmd: string; args: string[] };
+	/** Opt-in: run the child in a dedicated `team/<id>` git worktree (default off). */
+	worktree?: boolean;
 }): Promise<void> {
 	const bus = IrcBus.global();
 	const registry = AgentRegistry.global();
@@ -128,10 +132,16 @@ export async function spawnTeamSubagent(opts: {
 		});
 	}
 
+	let childCwd = opts.cwd;
+	if (opts.worktree) {
+		const repoRoot = (await git.repo.primaryRoot(opts.cwd)) ?? opts.cwd;
+		childCwd = await ensureTeamWorktree(opts.id, repoRoot);
+	}
+
 	const spawn = buildTeamChildSpawn({
 		id: opts.id,
 		assignment: opts.assignment,
-		cwd: opts.cwd,
+		cwd: childCwd,
 		socketPath,
 		command: opts.command,
 	});
@@ -188,6 +198,38 @@ async function spawnViaCmux(args: {
 	} finally {
 		client.close();
 	}
+}
+
+/**
+ * Opt-in per-subagent isolation: a `team/<id>` branch checked out into a
+ * dedicated worktree under the omp worktrees dir. Idempotent — reuses an
+ * existing worktree for the branch. Run under the per-repo lock since worktrees
+ * of one repo share `.git` metadata that git locks without a waiter.
+ */
+export async function ensureTeamWorktree(id: string, repoRoot: string): Promise<string> {
+	const branch = `team/${id}`;
+	const branchRef = `refs/heads/${branch}`;
+	const worktreePath = getWorktreeDir(`team-${id}-${hashPath(repoRoot)}`);
+	return git.withRepoLock(repoRoot, async () => {
+		const existing = (await git.worktree.list(repoRoot)).find(entry => entry.branch === branchRef);
+		if (existing) return existing.path;
+		if (!(await git.ref.exists(repoRoot, branchRef))) {
+			await git.branch.create(repoRoot, branch, "HEAD");
+		}
+		await mkdir(dirname(worktreePath), { recursive: true });
+		await git.worktree.add(repoRoot, worktreePath, branch);
+		return worktreePath;
+	});
+}
+
+/** Remove a {@link ensureTeamWorktree} worktree and its branch. Best-effort. */
+export async function cleanupTeamWorktree(id: string, repoRoot: string): Promise<void> {
+	const branch = `team/${id}`;
+	const worktreePath = getWorktreeDir(`team-${id}-${hashPath(repoRoot)}`);
+	await git.withRepoLock(repoRoot, async () => {
+		await git.worktree.tryRemove(repoRoot, worktreePath);
+		await git.branch.tryDelete(repoRoot, branch);
+	});
 }
 
 /**
