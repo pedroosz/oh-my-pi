@@ -44,6 +44,20 @@ function whenRemoved(reg: AgentRegistry, id: string): Promise<void> {
 	return promise;
 }
 
+// Resolve once `id` reaches `status` via a status_changed event (rule ts-no-test-timers).
+function whenStatus(reg: AgentRegistry, id: string, status: string): Promise<void> {
+	const cur = reg.get(id);
+	if (cur?.status === status) return Promise.resolve();
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const off = reg.onChange(e => {
+		if (e.type === "status_changed" && e.ref.id === id && e.ref.status === status) {
+			off();
+			resolve();
+		}
+	});
+	return promise;
+}
+
 describe("team bridge end to end", () => {
 	it("delivers irc lead<->child across the socket", async () => {
 		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
@@ -211,6 +225,46 @@ describe("team bridge end to end", () => {
 		leadReg.unregister("LateLead");
 		await childForgetsLate;
 		expect(childReg.get("LateLead")).toBeUndefined();
+
+		connector.close();
+		await broker.close();
+	});
+
+	it("propagates status and activity across the bridge in both directions", async () => {
+		const sockPath = join(mkdtempSync(join(tmpdir(), "omp-team-")), "irc.sock");
+
+		const leadReg = new AgentRegistry();
+		const leadBus = new IrcBus(leadReg);
+		leadReg.register({ id: "Main", displayName: "Main", kind: "main", session: fakeSession([]) });
+		const broker = new TeamBroker(leadBus, leadReg);
+		await broker.listen(sockPath);
+
+		const childReg = new AgentRegistry();
+		const childBus = new IrcBus(childReg);
+		// Start the child idle so a later running transition is a real status change.
+		childReg.register({ id: "ChildA", displayName: "ChildA", kind: "sub", session: fakeSession([]), status: "idle" });
+		const connector = new TeamConnector(childBus, childReg, [{ id: "ChildA", displayName: "ChildA", kind: "sub" }]);
+
+		const leadSeesChild = whenRegistered(leadReg, "ChildA");
+		const childSeesMain = whenRegistered(childReg, "Main");
+		await connector.connect(sockPath);
+		await Promise.all([leadSeesChild, childSeesMain]);
+
+		// The initial hello carried the child's CURRENT (idle) status, not a hardcoded one.
+		expect(leadReg.get("ChildA")?.status).toBe("idle");
+
+		// child -> lead: ChildA goes running and records activity; both reach the lead.
+		const leadSeesRunning = whenStatus(leadReg, "ChildA", "running");
+		childReg.setStatus("ChildA", "running");
+		childReg.setActivity("ChildA", "doing the thing");
+		await leadSeesRunning;
+		expect(leadReg.get("ChildA")?.activity).toBe("doing the thing");
+
+		// lead -> child: Main goes idle; the change reaches the child's roster ref.
+		const childSeesIdle = whenStatus(childReg, "Main", "idle");
+		leadReg.setStatus("Main", "idle");
+		await childSeesIdle;
+		expect(childReg.get("Main")?.status).toBe("idle");
 
 		connector.close();
 		await broker.close();

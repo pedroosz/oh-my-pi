@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentRegistry } from "../registry/agent-registry";
+import type { AgentRegistry, AgentStatus } from "../registry/agent-registry";
 import type { IrcBus, IrcDeliveryReceipt, IrcMessage, IrcRemoteRouter } from "./bus";
 import { connectJsonSocket, type JsonConn, JsonSocketServer } from "./transport";
 
@@ -7,7 +7,12 @@ export interface PeerAgent {
 	id: string;
 	displayName: string;
 	kind: "main" | "sub";
+	status: AgentStatus;
+	activity?: string;
 }
+
+/** Identity of a local agent this process announces; its live status/activity is read from the registry at announce time. */
+type LocalAgent = Pick<PeerAgent, "id" | "displayName" | "kind">;
 
 interface HelloFrame {
 	t: "hello";
@@ -90,6 +95,32 @@ async function deliverInbound(bus: IrcBus, conn: JsonConn, frame: IrcFrame): Pro
 	conn.send({ t: "receipt", reqId: frame.reqId, receipt });
 }
 
+/**
+ * Register or update a remote peer ref from an announced {@link PeerAgent}.
+ * A real local ref this process owns is never clobbered (a remote stub with
+ * session:null would break local delivery). Returns true when a NEW ref was
+ * registered, so callers can track which ids they own for later withdrawal.
+ */
+function upsertRemoteRef(registry: AgentRegistry, peer: PeerAgent): boolean {
+	const existing = registry.get(peer.id);
+	if (existing) {
+		if (!existing.remote) return false;
+		registry.setStatus(peer.id, peer.status);
+		if (peer.activity !== undefined) registry.setActivity(peer.id, peer.activity);
+		return false;
+	}
+	registry.register({
+		id: peer.id,
+		displayName: peer.displayName,
+		kind: peer.kind,
+		session: null,
+		remote: true,
+		status: peer.status,
+	});
+	if (peer.activity !== undefined) registry.setActivity(peer.id, peer.activity);
+	return true;
+}
+
 /** Lead-side broker. */
 export class TeamBroker {
 	#server = new JsonSocketServer();
@@ -141,18 +172,11 @@ export class TeamBroker {
 		for (const a of agents) {
 			// Don't let an announced id clobber a real local ref the lead owns
 			// (e.g. Main): a remote stub with session:null would break local
-			// delivery. Mirrors the connector-side guard in #onRoster.
+			// delivery. upsertRemoteRef repeats this guard for the connector side.
 			const existing = this.registry.get(a.id);
 			if (existing && !existing.remote) continue;
 			this.#connOf.set(a.id, conn);
-			this.registry.register({
-				id: a.id,
-				displayName: a.displayName,
-				kind: a.kind,
-				session: null,
-				remote: true,
-				status: "idle",
-			});
+			upsertRemoteRef(this.registry, a);
 		}
 		this.#broadcastRoster();
 	}
@@ -196,7 +220,13 @@ export class TeamBroker {
 		const leadAgents: PeerAgent[] = this.registry
 			.list()
 			.filter(ref => !ref.remote && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"))
-			.map(ref => ({ id: ref.id, displayName: ref.displayName, kind: ref.kind === "main" ? "main" : "sub" }));
+			.map(ref => ({
+				id: ref.id,
+				displayName: ref.displayName,
+				kind: ref.kind === "main" ? "main" : "sub",
+				status: ref.status,
+				activity: ref.activity,
+			}));
 		const connectorAgents = all.flatMap(([, a]) => a);
 		for (const [conn, own] of all) {
 			const ownIds = new Set(own.map(a => a.id));
@@ -221,11 +251,13 @@ export class TeamConnector {
 	#conn: JsonConn | undefined;
 	readonly #waiter = makeReceiptWaiter();
 	readonly #remoteIds = new Set<string>();
+	#unsubscribeRegistry: (() => void) | undefined;
+	#helloScheduled = false;
 
 	constructor(
 		private readonly bus: IrcBus,
 		private readonly registry: AgentRegistry,
-		private readonly localAgents: PeerAgent[],
+		private readonly localAgents: readonly LocalAgent[],
 	) {}
 
 	async connect(socketPath: string): Promise<void> {
@@ -244,10 +276,19 @@ export class TeamConnector {
 			// against a dead conn.
 			this.bus.setRemoteRouter(undefined);
 			this.#conn = undefined;
+			this.#unsubscribeRegistry?.();
+			this.#unsubscribeRegistry = undefined;
 			for (const id of this.#remoteIds) this.registry.unregister(id);
 			this.#remoteIds.clear();
 		});
-		conn.send({ t: "hello", agents: this.localAgents });
+		this.#sendHello();
+		// Re-announce when one of THIS connector's local agents changes status
+		// (running<->idle) so the lead's roster tracks the child live. Debounced
+		// to one hello per microtask, mirroring the broker's roster rebroadcast.
+		// Remote-ref churn from #onRoster is ignored (those ids aren't local).
+		this.#unsubscribeRegistry = this.registry.onChange(event => {
+			if (this.localAgents.some(a => a.id === event.ref.id)) this.#scheduleHello();
+		});
 		const router: IrcRemoteRouter = { deliver: msg => this.#sendToBroker(msg) };
 		this.bus.setRemoteRouter(router);
 	}
@@ -258,6 +299,33 @@ export class TeamConnector {
 		const p = this.#waiter.track(reqId);
 		this.#conn.send({ t: "irc", reqId, msg });
 		return p;
+	}
+
+	#scheduleHello(): void {
+		if (this.#helloScheduled) return;
+		this.#helloScheduled = true;
+		queueMicrotask(() => {
+			this.#helloScheduled = false;
+			this.#sendHello();
+		});
+	}
+
+	/** Announce local agents with their CURRENT status/activity, read live from the registry. */
+	#sendHello(): void {
+		this.#conn?.send({ t: "hello", agents: this.#localRoster() });
+	}
+
+	#localRoster(): PeerAgent[] {
+		return this.localAgents.map(a => {
+			const ref = this.registry.get(a.id);
+			return {
+				id: a.id,
+				displayName: a.displayName,
+				kind: a.kind,
+				status: ref?.status ?? "running",
+				activity: ref?.activity,
+			};
+		});
 	}
 
 	#onRoster(agents: PeerAgent[]): void {
@@ -271,20 +339,13 @@ export class TeamConnector {
 			this.#remoteIds.delete(id);
 		}
 		for (const a of agents) {
-			if (this.registry.get(a.id)) continue;
-			this.registry.register({
-				id: a.id,
-				displayName: a.displayName,
-				kind: a.kind,
-				session: null,
-				remote: true,
-				status: "idle",
-			});
-			this.#remoteIds.add(a.id);
+			if (upsertRemoteRef(this.registry, a)) this.#remoteIds.add(a.id);
 		}
 	}
 
 	close(): void {
+		this.#unsubscribeRegistry?.();
+		this.#unsubscribeRegistry = undefined;
 		this.bus.setRemoteRouter(undefined);
 		this.#conn?.close();
 	}
